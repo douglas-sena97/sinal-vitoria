@@ -20,15 +20,18 @@ html,body{height:100%;margin:0;background:var(--asfalto);color:var(--giz);font-f
 #velN{display:block;font-size:56px;line-height:1;font-weight:800;font-variant-numeric:tabular-nums}
 #velN.acima{color:var(--vermelho)}
 #vel small{font-size:13px;color:#aab3ba}
-.al{display:flex;align-items:center;gap:10px;font-size:18px;line-height:1.5}
-.al::before{content:"";width:12px;height:12px;border-radius:50%;flex:none}
+.al{display:flex;align-items:flex-start;gap:10px;font-size:16px;line-height:1.4;margin:2px 0}
+.al::before{content:"";width:12px;height:12px;border-radius:50%;flex:none;margin-top:5px}
 #aRadar::before{background:var(--vermelho)}
 #aSem::before{background:var(--ambar)}
 #barra{position:fixed;left:0;right:0;bottom:0;z-index:1000;padding:10px 12px calc(env(safe-area-inset-bottom,0px) + 10px);background:var(--asfalto);border-top:1px solid var(--cinza)}
 #status{font-size:13px;color:#aab3ba;margin-bottom:8px;min-height:1.2em}
-#botoes{display:flex;gap:8px}
-button{flex:1;min-height:44px;border:1px solid var(--cinza);border-radius:8px;background:#222a30;color:var(--giz);font:inherit;font-size:14px}
+#botoes{display:flex;gap:8px;flex-wrap:wrap}
+button{flex:1 1 22%;min-height:44px;border:1px solid var(--cinza);border-radius:8px;background:#222a30;color:var(--giz);font:inherit;font-size:14px}
 button:focus-visible{outline:3px solid var(--verde);outline-offset:2px}
+[hidden]{display:none!important}
+#conf{background:#222a30;border:1px solid var(--ambar);border-radius:8px;padding:10px;margin-bottom:8px;font-size:14px;line-height:1.4}
+#conf div{display:flex;gap:8px;margin-top:8px}
 .leaflet-bottom{bottom:110px!important}
 </style>
 </head>
@@ -42,12 +45,14 @@ button:focus-visible{outline:3px solid var(--verde);outline-offset:2px}
   </div>
 </div>
 <div id="barra">
+  <div id="conf" hidden><span id="confT"></span><div><button id="cSim">Sim, registrar</button><button id="cNao">Não, descartar</button></div></div>
   <div id="status">Carregando dados…</div>
   <div id="botoes">
     <button id="bSeguir">Centralizar</button>
     <button id="bVoz">Voz: off</button>
     <button id="bTeste">Testar</button>
     <button id="bAtualizar">Atualizar</button>
+    <button id="bMarcar" hidden>Sinal fechou</button>
   </div>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
@@ -80,7 +85,7 @@ function resumo(){
 async function carregar(forcar){
   $('status').textContent='Carregando dados…';
   if(!forcar){
-    try{const c=JSON.parse(localStorage.getItem('sinal-gv')||'null');
+    try{const c=JSON.parse(localStorage.getItem('sinal-gv2')||'null');
       if(c&&Date.now()-c.t<6048e5){pontos=c.p;desenhar();resumo();return}}catch(e){}
   }
   try{
@@ -88,8 +93,8 @@ async function carregar(forcar){
     if(!r.ok)throw new Error(r.status);
     const j=await r.json();
     pontos=j.elements.map(e=>{const t=e.tags||{};
-      return {lat:e.lat,lon:e.lon,tipo:(t.highway==='speed_camera'||t.enforcement==='maxspeed')?'radar':'semaforo',max:t.maxspeed||null}});
-    try{localStorage.setItem('sinal-gv',JSON.stringify({t:Date.now(),p:pontos}))}catch(e){}
+      return {id:e.id,lat:e.lat,lon:e.lon,tipo:(t.highway==='speed_camera'||t.enforcement==='maxspeed')?'radar':'semaforo',max:t.maxspeed||null}});
+    try{localStorage.setItem('sinal-gv2',JSON.stringify({t:Date.now(),p:pontos}))}catch(e){}
     desenhar();resumo();
   }catch(e){$('status').textContent='Falha ao baixar os dados. Toque em Atualizar.'}
 }
@@ -98,11 +103,69 @@ let ant=null,rumo=null,seguir=true,voz=false,teste=false,primeiro=false;
 const visto=new Set();
 const eu=L.circleMarker([0,0],{radius:9,color:'#fff',weight:3,fillColor:'#2f7cf6',fillOpacity:1});
 
+// ---- Aprendizado dos tempos (por enquanto guardado só neste celular) ----
+let OBS={},HIT={},par=null,man=null,pend=null,tConf=null,tAv=null,atual=null;
+try{OBS=JSON.parse(localStorage.getItem('sinal-obs')||'{}');HIT=JSON.parse(localStorage.getItem('sinal-hit')||'{}')}catch(e){}
+function salvar(){try{localStorage.setItem('sinal-obs',JSON.stringify(OBS));localStorage.setItem('sinal-hit',JSON.stringify(HIT))}catch(e){}}
+function aviso(m){$('status').textContent=m;clearTimeout(tAv);tAv=setTimeout(resumo,7000)}
+function periodo(d=new Date()){const g=d.getDay(),h=d.getHours()+d.getMinutes()/60;
+  return (g===0||g===6)?'fds':(h>=6&&h<9.5)?'pico-manha':(h>=16.5&&h<19.5)?'pico-tarde':(h>=20||h<6)?'noite':'dia'}
+function media(a){const s=[...a].sort((x,y)=>x-y),m=s[s.length>>1],f=a.length>=4?a.filter(x=>Math.abs(x-m)<=m*.5):a;return f.reduce((x,y)=>x+y,0)/f.length}
+function estima(id){
+  const o=OBS[id];if(!o)return null;
+  let l=o[periodo()];if(!l||!l.length)l=Object.values(o).flat();
+  if(!l.length)return null;
+  const c=l.filter(x=>x.c).map(x=>x.w),n=l.length;let v,cv=1;
+  if(c.length){v=media(c);cv=Math.sqrt(c.reduce((a,x)=>a+(x-v)**2,0)/c.length)/v}
+  else v=Math.max(...l.map(x=>x.w))*(n+1)/n;
+  return {v,n,cv,var:c.length>=3&&cv>=.4,conf:c.length>=8&&cv<.25?'alta':c.length>=3&&cv<.4?'média':'baixa'}
+}
+function registrar(id,w,c){
+  const per=periodo(),E=estima(id);let ok=null;
+  if(E){ok=c?Math.abs(w-E.v)<=Math.max(5,E.v*.15):w<=E.v*1.15;const h=HIT[id]||(HIT[id]={h:0,m:0});ok?h.h++:h.m++}
+  const l=(OBS[id]||(OBS[id]={}))[per]||(OBS[id][per]=[]),o={w:Math.round(w),c,t:Date.now()};
+  l.push(o);if(l.length>50)l.shift();salvar();
+  return {o,E,ok,per}
+}
+function proximo(r){
+  if(!atual)return null;let b=null;
+  for(const p of pontos){if(p.tipo!=='semaforo'||Math.abs(p.lat-atual[0])>.002||Math.abs(p.lon-atual[1])>.002)continue;
+    const d=dist(atual[0],atual[1],p.lat,p.lon);if(d<=r&&(!b||d<b.d))b={...p,d}}
+  return b
+}
+function txtSem(s,d){
+  const E=estima(s.id),h=HIT[s.id];let t;
+  if(par&&par.s.id===s.id){const w=(Date.now()-par.t0)/1000;
+    t=`Parado há ${Math.round(w)} s`+(E?(E.v>w?`, abre em até ${Math.round(E.v-w)} s`:', deve abrir a qualquer momento'):', aprendendo este semáforo')}
+  else t=`Semáforo a ${Math.round(d)} m`+(E?`, vermelho ~${Math.round(E.v)} s`:', tempo ainda não aprendido');
+  if(E)t+=` (confiança ${E.conf}${E.var?', tempo variável':''}${h&&h.h+h.m?`, acertou ${h.h} de ${h.h+h.m}`:''})`;
+  return t
+}
+function fechaConf(){$('conf').hidden=true;pend=null;clearTimeout(tConf)}
+function fimParada(q){
+  const w=(Date.now()-q.t0)/1000;if(w<4||w>240||q.skip)return;
+  const r=registrar(q.s.id,w,false);pend={id:q.s.id,per:r.per,o:r.o,ok:r.ok};
+  $('confT').textContent=`Esperou ${Math.round(w)} s neste semáforo`+(r.E?` (o app estimava até ${Math.round(r.E.v)} s: ${r.ok?'confere':'não confere'}). `:'. ')+'Foi por causa do sinal vermelho?';
+  $('conf').hidden=false;clearTimeout(tConf);tConf=setTimeout(fechaConf,25000)
+}
+$('cSim').onclick=()=>{if(!pend)return;const id=pend.id;fechaConf();const E=estima(id);if(E)aviso(`Registrado. Novo tempo estimado: ~${Math.round(E.v)} s`)};
+$('cNao').onclick=()=>{if(!pend)return;const l=OBS[pend.id][pend.per],i=l.indexOf(pend.o);if(i>=0)l.splice(i,1);
+  if(pend.ok!=null){const h=HIT[pend.id];pend.ok?h.h--:h.m--}salvar();fechaConf();aviso('Espera descartada')};
+$('bMarcar').onclick=()=>{
+  if(!man){const z=proximo(60);if(!z)return;man={s:z,t0:Date.now()};$('bMarcar').textContent='Sinal abriu';return}
+  const w=(Date.now()-man.t0)/1000,id=man.s.id;man=null;$('bMarcar').textContent='Sinal fechou';
+  if(w<3||w>240)return;
+  const r=registrar(id,w,true);if(par)par.skip=true;
+  aviso(`Vermelho de ${Math.round(w)} s registrado`+(r.E?` (previsto ${Math.round(r.E.v)} s: ${r.ok?'confere':'não confere'})`:''))
+};
+setInterval(()=>{if(par&&atual)$('aSem').textContent=txtSem(par.s,dist(atual[0],atual[1],par.s.lat,par.s.lon))},1000);
+// ---- fim aprendizado ----
 function avisar(t){
   try{navigator.vibrate&&navigator.vibrate([200,100,200])}catch(e){}
   if(voz&&'speechSynthesis' in window){const u=new SpeechSynthesisUtterance(t);u.lang='pt-BR';speechSynthesis.cancel();speechSynthesis.speak(u)}
 }
 function posicao(lat,lon,vel,hd){
+  atual=[lat,lon];
   if(hd!=null&&!isNaN(hd)&&vel>1)rumo=hd;
   else if(ant&&dist(ant[0],ant[1],lat,lon)>8)rumo=rumoPara(ant[0],ant[1],lat,lon);
   if(!ant||dist(ant[0],ant[1],lat,lon)>8)ant=[lat,lon];
@@ -110,6 +173,10 @@ function posicao(lat,lon,vel,hd){
   if(seguir){if(!primeiro){map.setView([lat,lon],16);primeiro=true}else map.panTo([lat,lon])}
   const kmh=vel!=null&&!isNaN(vel)?vel*3.6:null;
   $('velN').textContent=kmh!=null?Math.round(kmh):'--';
+  const parado=vel!=null&&vel<.8,anda=vel!=null&&vel>2;
+  if(parado&&!par){const z=proximo(40);if(z)par={s:z,t0:Date.now(),skip:false}}
+  else if(par&&anda){const q=par;par=null;fimParada(q)}
+  $('bMarcar').hidden=!(man||proximo(60));
   let r=null,s=null;
   for(const p of pontos){
     if(Math.abs(p.lat-lat)>.004||Math.abs(p.lon-lon)>.004)continue;
@@ -119,8 +186,9 @@ function posicao(lat,lon,vel,hd){
   }
   const lim=r&&r.p.max?parseInt(r.p.max):null;
   $('aRadar').textContent=r?`Radar a ${Math.round(r.d)} m${lim?', limite '+lim:''}`:'Radar: nenhum à frente';
-  $('aSem').textContent=s?`Semáforo a ${Math.round(s.d)} m, tempo indisponível`:'Semáforo: nenhum à frente';
-  $('painel').className=r?'radar':s?'sem':'';
+  const ss=par?{p:par.s,d:dist(lat,lon,par.s.lat,par.s.lon)}:s;
+  $('aSem').textContent=ss?txtSem(ss.p,ss.d):'Semáforo: nenhum à frente';
+  $('painel').className=r?'radar':ss?'sem':'';
   $('velN').classList.toggle('acima',!!(lim&&kmh!=null&&kmh>lim));
   if(r){const k=r.p.lat+','+r.p.lon;if(!visto.has(k)){visto.add(k);avisar(`Radar à frente, ${Math.round(r.d/10)*10} metros`)}}
   else visto.clear();
@@ -131,7 +199,7 @@ $('bVoz').onclick=()=>{voz=!voz;$('bVoz').textContent='Voz: '+(voz?'on':'off');i
 $('bTeste').onclick=()=>{teste=!teste;$('bTeste').textContent=teste?'Testar: on':'Testar';
   if(teste)$('status').textContent='Modo teste: toque no mapa para simular sua posição';else resumo()};
 $('bAtualizar').onclick=()=>carregar(true);
-map.on('click',e=>{if(teste)posicao(e.latlng.lat,e.latlng.lng,null,null)});
+map.on('click',e=>{if(teste){atual=[e.latlng.lat,e.latlng.lng];posicao(e.latlng.lat,e.latlng.lng,proximo(30)?0:10,null)}});
 map.on('dragstart',()=>{seguir=false});
 
 if('geolocation' in navigator)navigator.geolocation.watchPosition(
