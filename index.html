@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#14181c">
+<link rel="manifest" href="manifest.json">
+<title>Sinal Vitória</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+:root{--asfalto:#14181c;--giz:#f1f3f4;--vermelho:#e5392f;--ambar:#f2a900;--verde:#2fbf71;--cinza:#4a545c}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--asfalto);color:var(--giz);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+#map{position:fixed;inset:0;background:var(--asfalto)}
+.tile-noite{filter:invert(1) hue-rotate(180deg) brightness(.8) contrast(.9) saturate(.5)}
+#painel{position:fixed;left:0;right:0;top:0;z-index:1000;display:flex;gap:16px;align-items:center;padding:calc(env(safe-area-inset-top,0px) + 10px) 14px 10px;background:var(--asfalto);border-bottom:5px solid var(--cinza)}
+#painel.radar{border-color:var(--vermelho)}
+#painel.sem{border-color:var(--ambar)}
+#vel{text-align:center;min-width:84px}
+#velN{display:block;font-size:56px;line-height:1;font-weight:800;font-variant-numeric:tabular-nums}
+#velN.acima{color:var(--vermelho)}
+#vel small{font-size:13px;color:#aab3ba}
+.al{display:flex;align-items:center;gap:10px;font-size:18px;line-height:1.5}
+.al::before{content:"";width:12px;height:12px;border-radius:50%;flex:none}
+#aRadar::before{background:var(--vermelho)}
+#aSem::before{background:var(--ambar)}
+#barra{position:fixed;left:0;right:0;bottom:0;z-index:1000;padding:10px 12px calc(env(safe-area-inset-bottom,0px) + 10px);background:var(--asfalto);border-top:1px solid var(--cinza)}
+#status{font-size:13px;color:#aab3ba;margin-bottom:8px;min-height:1.2em}
+#botoes{display:flex;gap:8px}
+button{flex:1;min-height:44px;border:1px solid var(--cinza);border-radius:8px;background:#222a30;color:var(--giz);font:inherit;font-size:14px}
+button:focus-visible{outline:3px solid var(--verde);outline-offset:2px}
+.leaflet-bottom{bottom:110px!important}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="painel">
+  <div id="vel"><b id="velN">--</b><small>km/h</small></div>
+  <div>
+    <div class="al" id="aRadar">Radar: nenhum à frente</div>
+    <div class="al" id="aSem">Semáforo: nenhum à frente</div>
+  </div>
+</div>
+<div id="barra">
+  <div id="status">Carregando dados…</div>
+  <div id="botoes">
+    <button id="bSeguir">Centralizar</button>
+    <button id="bVoz">Voz: off</button>
+    <button id="bTeste">Testar</button>
+    <button id="bAtualizar">Atualizar</button>
+  </div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script>
+const BBOX=[-20.55,-40.55,-20.15,-40.15]; // Grande Vitória (sul, oeste, norte, leste)
+const RAIO={radar:400,semaforo:150};
+const Q=`[out:json][timeout:60];(node["highway"="traffic_signals"](${BBOX});node["highway"="speed_camera"](${BBOX});node["enforcement"="maxspeed"](${BBOX}););out body;`;
+const $=id=>document.getElementById(id);
+const rad=d=>d*Math.PI/180;
+function dist(a,b,c,d){const x=rad(c-a),y=rad(d-b),h=Math.sin(x/2)**2+Math.cos(rad(a))*Math.cos(rad(c))*Math.sin(y/2)**2;return 12742000*Math.asin(Math.sqrt(h))}
+function rumoPara(a,b,c,d){const y=Math.sin(rad(d-b))*Math.cos(rad(c)),x=Math.cos(rad(a))*Math.sin(rad(c))-Math.sin(rad(a))*Math.cos(rad(c))*Math.cos(rad(d-b));return (Math.atan2(y,x)*180/Math.PI+360)%360}
+const difAng=(a,b)=>Math.abs(((a-b+540)%360)-180);
+
+const map=L.map('map',{zoomControl:false}).setView([-20.3155,-40.3128],13);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,className:'tile-noite',attribution:'© OpenStreetMap'}).addTo(map);
+const canvas=L.canvas({padding:.5}),camada=L.layerGroup().addTo(map);
+let pontos=[];
+
+function desenhar(){
+  camada.clearLayers();
+  [...pontos].sort((a,b)=>(a.tipo==='radar')-(b.tipo==='radar')).forEach(p=>{
+    const r=p.tipo==='radar',cor=r?'#e5392f':'#f2a900';
+    L.circleMarker([p.lat,p.lon],{renderer:canvas,radius:r?8:4,color:r?'#fff':cor,weight:r?2:1,fillColor:cor,fillOpacity:r?.95:.75}).addTo(camada);
+  });
+}
+function resumo(){
+  const r=pontos.filter(p=>p.tipo==='radar').length;
+  $('status').textContent=`${r} radares e ${pontos.length-r} semáforos carregados (OpenStreetMap)`;
+}
+async function carregar(forcar){
+  $('status').textContent='Carregando dados…';
+  if(!forcar){
+    try{const c=JSON.parse(localStorage.getItem('sinal-gv')||'null');
+      if(c&&Date.now()-c.t<6048e5){pontos=c.p;desenhar();resumo();return}}catch(e){}
+  }
+  try{
+    const r=await fetch('https://overpass-api.de/api/interpreter',{method:'POST',body:'data='+encodeURIComponent(Q)});
+    if(!r.ok)throw new Error(r.status);
+    const j=await r.json();
+    pontos=j.elements.map(e=>{const t=e.tags||{};
+      return {lat:e.lat,lon:e.lon,tipo:(t.highway==='speed_camera'||t.enforcement==='maxspeed')?'radar':'semaforo',max:t.maxspeed||null}});
+    try{localStorage.setItem('sinal-gv',JSON.stringify({t:Date.now(),p:pontos}))}catch(e){}
+    desenhar();resumo();
+  }catch(e){$('status').textContent='Falha ao baixar os dados. Toque em Atualizar.'}
+}
+
+let ant=null,rumo=null,seguir=true,voz=false,teste=false,primeiro=false;
+const visto=new Set();
+const eu=L.circleMarker([0,0],{radius:9,color:'#fff',weight:3,fillColor:'#2f7cf6',fillOpacity:1});
+
+function avisar(t){
+  try{navigator.vibrate&&navigator.vibrate([200,100,200])}catch(e){}
+  if(voz&&'speechSynthesis' in window){const u=new SpeechSynthesisUtterance(t);u.lang='pt-BR';speechSynthesis.cancel();speechSynthesis.speak(u)}
+}
+function posicao(lat,lon,vel,hd){
+  if(hd!=null&&!isNaN(hd)&&vel>1)rumo=hd;
+  else if(ant&&dist(ant[0],ant[1],lat,lon)>8)rumo=rumoPara(ant[0],ant[1],lat,lon);
+  if(!ant||dist(ant[0],ant[1],lat,lon)>8)ant=[lat,lon];
+  eu.setLatLng([lat,lon]);if(!map.hasLayer(eu))eu.addTo(map);
+  if(seguir){if(!primeiro){map.setView([lat,lon],16);primeiro=true}else map.panTo([lat,lon])}
+  const kmh=vel!=null&&!isNaN(vel)?vel*3.6:null;
+  $('velN').textContent=kmh!=null?Math.round(kmh):'--';
+  let r=null,s=null;
+  for(const p of pontos){
+    if(Math.abs(p.lat-lat)>.004||Math.abs(p.lon-lon)>.004)continue;
+    const d=dist(lat,lon,p.lat,p.lon);if(d>RAIO[p.tipo])continue;
+    if(rumo!=null&&d>25&&difAng(rumoPara(lat,lon,p.lat,p.lon),rumo)>60)continue;
+    if(p.tipo==='radar'){if(!r||d<r.d)r={p,d}}else if(!s||d<s.d)s={p,d}
+  }
+  const lim=r&&r.p.max?parseInt(r.p.max):null;
+  $('aRadar').textContent=r?`Radar a ${Math.round(r.d)} m${lim?', limite '+lim:''}`:'Radar: nenhum à frente';
+  $('aSem').textContent=s?`Semáforo a ${Math.round(s.d)} m, tempo indisponível`:'Semáforo: nenhum à frente';
+  $('painel').className=r?'radar':s?'sem':'';
+  $('velN').classList.toggle('acima',!!(lim&&kmh!=null&&kmh>lim));
+  if(r){const k=r.p.lat+','+r.p.lon;if(!visto.has(k)){visto.add(k);avisar(`Radar à frente, ${Math.round(r.d/10)*10} metros`)}}
+  else visto.clear();
+}
+
+$('bSeguir').onclick=()=>{seguir=true;if(ant)map.panTo(ant)};
+$('bVoz').onclick=()=>{voz=!voz;$('bVoz').textContent='Voz: '+(voz?'on':'off');if(voz)avisar('Alertas de voz ativados')};
+$('bTeste').onclick=()=>{teste=!teste;$('bTeste').textContent=teste?'Testar: on':'Testar';
+  if(teste)$('status').textContent='Modo teste: toque no mapa para simular sua posição';else resumo()};
+$('bAtualizar').onclick=()=>carregar(true);
+map.on('click',e=>{if(teste)posicao(e.latlng.lat,e.latlng.lng,null,null)});
+map.on('dragstart',()=>{seguir=false});
+
+if('geolocation' in navigator)navigator.geolocation.watchPosition(
+  p=>{if(!teste)posicao(p.coords.latitude,p.coords.longitude,p.coords.speed,p.coords.heading)},
+  ()=>{$('status').textContent='GPS indisponível. Permita o acesso à localização.'},
+  {enableHighAccuracy:true,maximumAge:1000,timeout:20000});
+
+async function tela(){try{await navigator.wakeLock.request('screen')}catch(e){}}
+tela();document.addEventListener('visibilitychange',()=>{if(!document.hidden)tela()});
+if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
+carregar(false);
+</script>
+</body>
+</html>
